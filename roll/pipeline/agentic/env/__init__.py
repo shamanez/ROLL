@@ -17,7 +17,10 @@ gem.register("sokoban_native_env", entry_point="roll.pipeline.agentic.env.sokoba
 gem.register("deepeyes", entry_point="roll.pipeline.agentic.env.deepeyes:DeepEyesEnv")
 gem.register("rock_tb_native_env", entry_point="roll.pipeline.agentic.env.sandbox.rock_tb_native_env:RockTBNativeEnv")
 
-
+try:
+    gem.register("openreward_env", entry_point="roll.pipeline.agentic.env.openreward:OpenRewardEnv")
+except Exception as e:
+    logger.info(f"Failed to register openreward_env: {e}")
 
 try:
     # add webshop-minimal to PYTHONPATH
