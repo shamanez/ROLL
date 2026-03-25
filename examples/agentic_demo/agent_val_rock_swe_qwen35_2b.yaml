@@ -16,7 +16,7 @@ seed: 42
 logging_dir: ./output/logs
 output_dir: ./output
 model_name: ${exp_name}-${now:%Y%m%d_%H%M%S}
-rollout_dump_dir: /home/ubuntu/ALE-latest/ROLL-personal/output/rollout_dump
+rollout_dump_dir: ./output/rollout_dump
 system_envs:
   USE_MODELSCOPE: '1'
 
@@ -34,14 +34,10 @@ eval_steps: 0
 resume_from_checkpoint: false
 
 async_generation_ratio: 1
+# Qwen3.5 tool-call templates expect structured tool arguments.
 parse_tool_call_parameter_to_dict: true
+# Qwen3.5 chat templates do not auto-insert an empty system prompt.
 skip_mock_system_prompt: true
-
-track_with: wandb
-tracker_kwargs:
-  api_key: ${oc.env:WANDB_API_KEY}
-  project: roll-agentic
-  name: ${exp_name}
 
 rollout_batch_size: 4
 val_batch_size: 4
@@ -60,11 +56,13 @@ whiten_advantages: true
 entropy_loss_coef: 0
 max_grad_norm: 1.0
 
+# Swap these checkpoints to reuse the same setup with other Qwen3.5 dense variants.
+pretrain: Qwen/Qwen3.5-2B
+reward_pretrain: Qwen/Qwen3.5-2B
 
-pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3.5-2B
-reward_pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3.5-2B
 actor_train:
   model_args:
+    # fa2 doesn't work for now
     flash_attn: sdpa
     attn_implementation: sdpa
     disable_gradient_checkpointing: false
@@ -91,6 +89,7 @@ actor_train:
       recompute_granularity: full
   device_mapping: list(range(0,4))
   infer_batch_size: 1
+
 actor_infer:
   model_args:
     flash_attn: sdpa
@@ -98,13 +97,13 @@ actor_infer:
     disable_gradient_checkpointing: true
     dtype: bf16
   generating_args:
-    max_new_tokens: ${max_tokens_per_step} # single-turn response length
+    max_new_tokens: ${max_tokens_per_step}
     top_p: 1.0
     top_k: 50
     num_beams: 1
     temperature: 1.0
     num_return_sequences: 1
-    stop_strings: ["</tool_call>","</tool_call>\n","\n</tool_call>\n","\n</function>"]
+    stop_strings: ["</tool_call>", "</tool_call>\n", "\n</tool_call>\n", "\n</function>"]
     include_stop_str_in_output: true
   data_args:
     template: qwen3_coder
@@ -139,7 +138,7 @@ reference:
 
 reward_normalization:
   grouping: traj_group_id
-  method: mean
+  method: identity
 
 train_env_manager:
   max_env_num_per_worker: 1
@@ -159,14 +158,12 @@ val_env_manager:
   system_envs:
     ROCK_RTENV_PYTHON_V31114_INSTALL_CMD: '[ -f cpython31115.tar.gz ] && rm cpython31115.tar.gz; [ -d python ] && rm -rf python; wget -q -O cpython31115.tar.gz https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/20260303/cpython-3.11.15+20260303-x86_64-unknown-linux-gnu-install_only.tar.gz && tar -xzf cpython31115.tar.gz && mv python runtime-env'
 
-
 max_actions_per_traj: 25
 env_manager_cls: roll.pipeline.agentic.env_manager.agent_native_env_manager.AgentNativeStepEnvManager
 
 agent_config_common:
   agent_type: "default"
   run_cmd: 'iflow -p <<PROMPT>> --yolo'
-  # Dependency pre-installation; modify based on your sandbox image
   pre_init_cmds:
     - command: "apt-get update"
       timeout_seconds: 600
@@ -174,7 +171,6 @@ agent_config_common:
       timeout_seconds: 600
     - command: "apt-get install -y build-essential libc6-dev patch procps"
       timeout_seconds: 600
-    # Install helper tools like 'uv'
     - command: "wget -q https://xrl-sandbox-bucket.oss-cn-hangzhou.aliyuncs.com/uv-files/uv-x86_64-unknown-linux-gnu.tar.gz && tar -xzf uv-x86_64-unknown-linux-gnu.tar.gz --strip-components=1 -C /usr/local/bin && uv --version"
       timeout_seconds: 600
   model_service_config:
@@ -183,7 +179,6 @@ agent_config_common:
   runtime_env_config:
     type: node
     npm_registry: "https://registry.npmmirror.com"
-    # you can install your own version
     custom_install_cmd: "wget --retry-connrefused --tries=10 --waitretry=2 -O ~/iflow-cli.tgz 'http://cloud.iflow.cn/iflow-cli/iflow-ai-iflow-cli-for-roll-0-4-4-v5.tgz' && npm i -g ~/iflow-cli.tgz"
   env:
     IFLOW_apiKey: "test"
@@ -195,7 +190,6 @@ agent_config_common:
     IFLOW_tokensLimit: "128000"
     IFLOW_shellTimeout: "360000"
     IFLOW_coreTools: "Edit,exit_plan_mode,glob,list_directory,multi_edit,plan,read plan,read_file,read_many_files,save_memory,Search,Shell,task,web_fetch,web_search,write_file,xml_escape"
-
 
 custom_envs:
   RockTBNativeEnvTrain:
@@ -210,7 +204,7 @@ custom_envs:
       tools: ~
       max_steps: ${max_actions_per_traj}
       mode: "train"
-      sandbox_base_url: http://localhost:8080 # change to your own service address if needed
+      sandbox_base_url: http://localhost:8080
       user_id: "xxx"
       experiment_id: "test_tb_native"
       test_files: ["/terminal-bench-datasets/datasets/swebench-verified"]
@@ -227,7 +221,7 @@ custom_envs:
       tools: ~
       max_steps: ${max_actions_per_traj}
       mode: "val"
-      sandbox_base_url: http://localhost:8080 # change to your own service address if needed
+      sandbox_base_url: http://localhost:8080
       user_id: "xxx"
       experiment_id: "test_tb_native"
       test_files: ["/terminal-bench-datasets/datasets/swebench-verified"]
