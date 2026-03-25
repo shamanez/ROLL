@@ -338,7 +338,10 @@ class AgenticPipeline(BasePipeline):
                             metrics.update({"shrink/" + k: v for k, v in shrink_metrics.items()})
                         metrics["time/step_shrink"] = shrink_timer.last
 
-                    batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
+                    batch = compute_discounted_returns(
+                        batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma,
+                        failure_reward=getattr(self.pipeline_config, 'ipa_failure_reward', None),
+                    )
 
                     batch = self.adjust_batch(batch, mode=self.pipeline_config.batch_adjust_mode)
                     metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))

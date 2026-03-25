@@ -206,6 +206,10 @@ class AgenticConfig(PPOConfig):
     episode_reward_weight: float = field(default=1.0, metadata={"help": "Episode reward weight, used in GiGPO."})
     step_reward_weight: float = field(default=1.0, metadata={"help": "Step reward weight, used in GiGPO."})
     step_reward_gamma: float = field(default=0.95, metadata={"help": "Gamma parameter for step reward calculation"})
+    ipa_failure_reward: Optional[float] = field(
+        default=None,
+        metadata={"help": "IPA: reward for failed trajectories. Set to -1.0 to activate non-positive TIS branch."},
+    )
     ratio_type: Literal["token", "segment"] = field(default="token", metadata={"help": "Ratio type: token or segment"})
     exp_mode: str = field(
         default="train",
