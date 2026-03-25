@@ -64,12 +64,15 @@ class ActorWorker(BaseActorWorker):
             train_infer_is_weight = data.batch['train_infer_is_weight']
 
         if self.pipeline_config.ratio_type == "segment":
-            # 计算序列级别的 ratio：对每段连续的1分别计算 masked_mean，不连续的段不相乘
-            log_ratio = log_probs - old_log_probs
+            # Chunk-level geometric mean IS ratio (paper Eq. 8):
+            # ρ_k = exp(mean(log π_current - log π_behavior)) per chunk.
+            # Uses infer_logprobs (vLLM rollout) as behavior policy — the only surviving
+            # record of the behavior policy in async training where old weights are overwritten.
+            log_ratio = log_probs - infer_log_probs
             masked_log_ratio = compute_segment_masked_mean(log_ratio, response_mask)
             ratio = masked_log_ratio.exp()
         else:
-            ratio = (log_probs - old_log_probs).exp()
+            ratio = (log_probs - infer_log_probs).exp()
 
         pg_variant = self._get_or_cache_config("pg_variant", "vanilla")
         self._cached_metrics = {
@@ -515,10 +518,17 @@ class ActorWorker(BaseActorWorker):
         positive_token_mask = positive_mask.unsqueeze(-1).expand_as(log_probs)
         negative_token_mask = negative_mask.unsqueeze(-1).expand_as(log_probs)
 
-        # Positive branch: weighted SFT (no IS ratio) - paper Eq. 9 left term
+        # Positive branch (paper Eq. 9, left term): weighted SFT, no IS ratio.
+        # Directly reinforce successful chunks with weight G_k.
         positive_loss = -advantages * log_probs * positive_token_mask
 
-        # Non-positive branch: TIS [0,1] - paper Eq. 9 right term
+        # Non-positive branch (paper Eq. 9, right term): chunk-level TIS clipped to [0, 1].
+        # The ratio here is already the chunk-level geometric mean (one scalar per chunk,
+        # broadcast to all tokens in the chunk via compute_segment_masked_mean).
+        # Truncation to [0, 1]: cap at 1 (never amplify push-down gradient beyond on-policy),
+        # natural attenuation below 1 (model already moved away from this action).
+        # Only has effect when ipa_failure_reward is set — with 0/1 rewards, G_k=0 for
+        # failures so TIS multiplies zero regardless.
         clipped_ratio = torch.clamp(ratio, min=0.0, max=1.0).detach()
         negative_loss = -clipped_ratio * advantages * log_probs * negative_token_mask
 

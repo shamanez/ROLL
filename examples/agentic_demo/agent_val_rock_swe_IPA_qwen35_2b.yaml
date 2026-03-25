@@ -27,7 +27,7 @@ checkpoint_config:
 num_gpus_per_node: 8
 rpc_timeout: 72000
 
-# Quick smoke test: 5 steps, no validation
+# Smoke test: 5 steps to verify TIS ratio fix
 max_steps: 5
 save_steps: 50
 logging_steps: 1
@@ -56,7 +56,7 @@ ppo_epochs: 1
 adv_estimator: "step_reinforce"
 batch_adjust_mode: "random_sample"
 step_reward_gamma: 0.95                  # chunk-level temporal credit: G_k = 0.95^{K-k} * R_final
-ipa_failure_reward: -1.0                 # map failure (R=0) to -1, activating non-positive TIS branch
+ipa_failure_reward: -1.0                 # Temporarily enabled to verify TIS ratio fix
 ratio_type: "segment"                    # chunk-level geometric mean IS ratio
 
 init_kl_coef: 0.0
@@ -94,7 +94,7 @@ actor_train:
     learning_rate: 1.0e-6
     weight_decay: 0
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 8
     warmup_steps: 0
   data_args:
     template: qwen3_coder
