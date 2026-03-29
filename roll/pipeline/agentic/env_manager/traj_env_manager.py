@@ -13,6 +13,13 @@ from tensordict import TensorDict
 from transformers import PreTrainedTokenizer
 
 from roll.pipeline.agentic.llm_proxy import create_llm_proxy, BaseLLMProxy
+
+def _wrap_as_object_array(obj):
+    """Wrap a single object (e.g. a list) into a shape-(1,) numpy object array
+    without numpy unpacking it into a 2D array."""
+    arr = np.empty(1, dtype=object)
+    arr[0] = obj
+    return arr
 from roll.pipeline.agentic.env_manager.base_env_manager import RolloutCache, BaseEnvManager
 from roll.utils.env_action_limiter import get_global_limiter
 from roll.distributed.scheduler.rollout_scheduler import GroupQueueManager
@@ -293,7 +300,7 @@ class TrajEnvManager(BaseEnvManager):
         last_cache.pop("reward", None)
         history.append(last_cache)
 
-        scores = [i['reward'] for i in self.rollout_cache.history]
+        scores = [i['reward'] for i in self.rollout_cache.history if 'reward' in i and 'response_ids' in i]
         episode_score = sum(scores)
 
         token_ids = []
@@ -301,6 +308,8 @@ class TrajEnvManager(BaseEnvManager):
         response_masks = []
         infer_logprobs = []
         for items in self.rollout_cache.history:
+            if "response_ids" not in items:
+                break
             token_ids.extend(items["prompt_ids"])
             token_ids.extend(items["response_ids"])
             prompt_masks.extend([1] * len(items["prompt_ids"]) + [0] * len(items["response_ids"]))
@@ -308,11 +317,17 @@ class TrajEnvManager(BaseEnvManager):
             if "infer_logprobs" in items:
                 infer_logprobs.extend([0] * len(items["prompt_ids"]) + items["infer_logprobs"])
 
+        # Guard: if no valid chunks, create a minimal placeholder with one padding token
+        if not token_ids:
+            token_ids = [self.tokenizer.pad_token_id]
+            response_masks = [0]
+            prompt_masks = [1]
+
         input_ids =torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
         attention_mask = torch.tensor([1] * len(token_ids), dtype=torch.long).unsqueeze(0)
         response_mask = torch.tensor(response_masks, dtype=torch.bool).unsqueeze(0)
 
-        first_response_idx = response_masks.index(1)
+        first_response_idx = response_masks.index(1) if 1 in response_masks else 0
         prompt_masks = [1] * first_response_idx + [0] * (len(token_ids) - first_response_idx)
         prompt_mask =torch.tensor(prompt_masks, dtype=torch.bool).unsqueeze(0)
         score_tensor = torch.tensor([0] * len(token_ids), dtype=torch.float).unsqueeze(0)
@@ -359,7 +374,7 @@ class TrajEnvManager(BaseEnvManager):
             "env_ids": np.array([self.rollout_cache.env_id], dtype=object),
             "group_ids": np.array([self.rollout_cache.group_id], dtype=object),
             "tags": np.array([self.rollout_cache.tag], dtype=object),
-            "step_scores": np.array([scores], dtype=object),
+            "step_scores": _wrap_as_object_array(scores),
             "episode_scores": np.array([episode_score], dtype=object),
         })
 

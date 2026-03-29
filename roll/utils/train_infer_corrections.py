@@ -122,7 +122,6 @@ def compute_train_infer_correction(
             if f.ratio_enabled:
                 m_ratio = (ratio[agg] >= f.ratio_low).float() * (ratio[agg] <= f.ratio_high).float()
 
-                # Log pass rate of this filter over currently active tokens
                 metrics[f"actor/train_infer_{agg}_ratio_mask_mean@sum"] = agg_loss(
                     loss_mat=m_ratio,
                     loss_mask=base_mask,
@@ -130,7 +129,6 @@ def compute_train_infer_correction(
                     batch_num_tokens=global_valid_tokens,
                 ).detach().item()
 
-                # Log mean value of the ratio at this granularity (for monitoring)
                 val_key = f"actor/train_infer_ratio_{agg}_mean@sum"
                 if val_key not in recorded_val_metrics:
                     metrics[val_key] = agg_loss(
@@ -147,7 +145,6 @@ def compute_train_infer_correction(
             if f.diff_enabled:
                 m_diff = (diff[agg] >= f.diff_low).float() * (diff[agg] <= f.diff_high).float()
 
-                # Log pass rate of this filter
                 metrics[f"actor/train_infer_{agg}_diff_mask_mean"] = agg_loss(
                     loss_mat=m_diff,
                     loss_mask=base_mask,
@@ -155,7 +152,6 @@ def compute_train_infer_correction(
                     batch_num_tokens=global_valid_tokens,
                 ).detach().item()
 
-                # Log mean value of the difference at this granularity
                 val_key = f"actor/train_infer_diff_{agg}_mean@sum"
                 if val_key not in recorded_val_metrics:
                     metrics[val_key] = agg_loss(

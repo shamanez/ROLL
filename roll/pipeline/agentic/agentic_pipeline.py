@@ -338,7 +338,10 @@ class AgenticPipeline(BasePipeline):
                             metrics.update({"shrink/" + k: v for k, v in shrink_metrics.items()})
                         metrics["time/step_shrink"] = shrink_timer.last
 
-                    batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
+                    batch = compute_discounted_returns(
+                        batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma,
+                        failure_reward=getattr(self.pipeline_config, 'ipa_failure_reward', None),
+                    )
 
                     batch = self.adjust_batch(batch, mode=self.pipeline_config.batch_adjust_mode)
                     metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
@@ -433,36 +436,53 @@ class AgenticPipeline(BasePipeline):
                     metrics["time/step_cal_response_level_mask"] = timer.last
 
                     # PHASE 13: Advantage Computation
-                    with Timer(name="cal_response_norm_rewards", logger=None) as timer:
-                        # Rewards need to be processed after grouping
-                        # We can group by tag(env_type)/traj_group_id(group)/batch(rollout_batch)... to compute rewards / advantages
-                        # The compute_response_level_rewards function injects a response_level_rewards key into batch.batch.
-                        batch, reward_metrics = compute_response_level_rewards(batch=batch, pipeline_config=self.pipeline_config)
-                        metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                        metrics.update(reward_metrics)
-                    metrics["time/step_cal_norm_rewards"] = timer.last
+                    if batch.meta_info.get("traj_reward_mode", False):
+                        # Traj mode: step_rewards is already token-level [batch, seq_len] with G_k per segment.
+                        # Skip compute_response_level_rewards, expand_to_token_level, compute_reinforce_return.
+                        with Timer(name="cal_traj_advantages", logger=None) as timer:
+                            response_mask = batch.batch["response_mask"][:, 1:]
+                            token_level_rewards = batch.batch["step_rewards"][:, 1:].float()
+                            token_level_rewards = token_level_rewards * response_mask.float()
+                            batch.batch["token_level_rewards"] = token_level_rewards
+                            batch.batch["advantages"] = token_level_rewards
+                            batch.batch["returns"] = token_level_rewards
+                            batch.batch["raw_advantages"] = token_level_rewards
+                        metrics["time/step_cal_norm_rewards"] = timer.last
+                        metrics["time/step_cal_token_reward"] = 0.0
+                        metrics["time/step_adv"] = 0.0
+                        metrics.update({"critic/kl": 0.0, "critic/kl_coef": 0})
+                    else:
+                        # Step mode: existing reward/advantage computation
+                        with Timer(name="cal_response_norm_rewards", logger=None) as timer:
+                            # Rewards need to be processed after grouping
+                            # We can group by tag(env_type)/traj_group_id(group)/batch(rollout_batch)... to compute rewards / advantages
+                            # The compute_response_level_rewards function injects a response_level_rewards key into batch.batch.
+                            batch, reward_metrics = compute_response_level_rewards(batch=batch, pipeline_config=self.pipeline_config)
+                            metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                            metrics.update(reward_metrics)
+                        metrics["time/step_cal_norm_rewards"] = timer.last
 
-                    with Timer(name="cal_token_reward", logger=None) as timer:
-                        # Expand compute_response_level_rewards and add kl_penalty.
-                        # batch, kl_metrics = apply_kl_penalty(data=batch, kl_ctrl=self.kl_ctrl, kl_penalty=self.pipeline_config.kl_penalty)
-                        batch, token_level_metrics = compute_token_reward(batch, self.pipeline_config, self.kl_ctrl)
-                        metrics.update(token_level_metrics)
-                    metrics["time/step_cal_token_reward"] = timer.last
+                        with Timer(name="cal_token_reward", logger=None) as timer:
+                            # Expand compute_response_level_rewards and add kl_penalty.
+                            # batch, kl_metrics = apply_kl_penalty(data=batch, kl_ctrl=self.kl_ctrl, kl_penalty=self.pipeline_config.kl_penalty)
+                            batch, token_level_metrics = compute_token_reward(batch, self.pipeline_config, self.kl_ctrl)
+                            metrics.update(token_level_metrics)
+                        metrics["time/step_cal_token_reward"] = timer.last
 
-                    with Timer(name="compute_advantage", logger=None) as timer:
-                        # Is the advantage calculated globally across the batch, or within each group?
-                        batch = agentic_compute_advantage(
-                            data=batch,
-                            gamma=self.pipeline_config.gamma,
-                            lambd=self.pipeline_config.lambd,
-                            adv_estimator=self.pipeline_config.adv_estimator,
-                            advantage_clip=self.pipeline_config.advantage_clip,
-                            whiten_advantages=self.pipeline_config.whiten_advantages,
-                            whiten_rewards=self.pipeline_config.whiten_rewards,
-                            pipeline_config=self.pipeline_config,
-                        )
-                        metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                    metrics["time/step_adv"] = timer.last
+                        with Timer(name="compute_advantage", logger=None) as timer:
+                            # Is the advantage calculated globally across the batch, or within each group?
+                            batch = agentic_compute_advantage(
+                                data=batch,
+                                gamma=self.pipeline_config.gamma,
+                                lambd=self.pipeline_config.lambd,
+                                adv_estimator=self.pipeline_config.adv_estimator,
+                                advantage_clip=self.pipeline_config.advantage_clip,
+                                whiten_advantages=self.pipeline_config.whiten_advantages,
+                                whiten_rewards=self.pipeline_config.whiten_rewards,
+                                pipeline_config=self.pipeline_config,
+                            )
+                            metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                        metrics["time/step_adv"] = timer.last
 
                     if self.pipeline_config.enable_old_logprobs_recompute:
                         batch, corr_metrics = apply_train_infer_correction_to_batch(self.pipeline_config, batch,
@@ -936,7 +956,7 @@ def compute_train_data_metrics(batch):
     # token_level_scores are per-token scores assigned by the reward model, possibly after normalization/clipping
     # score denotes the raw environment reward
     episode_scores = get_episode_scores(batch)
-    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    token_level_rewards = batch.batch["token_level_rewards"]
     advantages = batch.batch["advantages"]
     # fix: https://github.com/volcengine/verl/pull/60
     response_mask = batch.batch["response_mask"][:, 1:].bool()
@@ -946,8 +966,9 @@ def compute_train_data_metrics(batch):
     returns = batch.batch["returns"]
     non_prompt_mask = (torch.logical_not(batch.batch["prompt_mask"]) * batch.batch["attention_mask"]).float().sum(-1)
 
-    # 从 batch 中提取 traj_rollout_time 相关指标
-    # traj_rollout_times = []
+    # Per-sequence reward: masked mean of token-level rewards (not sum).
+    sequence_reward = token_level_rewards.sum(-1)
+
     metrics = {
         # score, sequence_score from env
         "critic/score/mean": torch.mean(episode_scores).detach().item(),

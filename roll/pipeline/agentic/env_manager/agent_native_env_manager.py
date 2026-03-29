@@ -18,6 +18,9 @@ from roll.pipeline.agentic.env_manager.traj_env_manager import TrajEnvManager
 from roll.utils.constants import GenerateStopReason, EpisodeStopReason
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.hash_utils import compute_object_hash
+from roll.utils.logging import get_logger
+
+_observe_logger = get_logger()
 
 
 class AgentNativeStepEnvManager(TrajEnvManager):
@@ -191,7 +194,17 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             content["infer_logprobs"] = infer_logprobs.tolist()
 
         content["response_ids"] = response_ids
-        content["messages"].append({"role": "assistant", "content": self.tokenizer.decode(response_ids, skip_special_tokens=True)})
+        decoded_response = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+        content["messages"].append({"role": "assistant", "content": decoded_response})
+
+        # --- Observability: log model output ---
+        _observe_logger.info(
+            "[OBSERVE][MODEL_OUTPUT] step=%d response_tokens=%d has_tool_call=%s response=%.500s",
+            self.rollout_cache.step, len(response_ids),
+            "<tool_call>" in decoded_response,
+            decoded_response.replace("\n", "\\n"),
+        )
+
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
         return lm_output
 
@@ -221,11 +234,28 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         current_cache["prompt_ids"] = prompt_ids
         current_cache['state_hash'] = compute_object_hash(messages)
         current_cache['messages'] = messages
+
+        # --- Observability: log model input ---
+        prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+        _observe_logger.info(
+            "[OBSERVE][MODEL_INPUT] step=%d num_messages=%d prompt_tokens=%d tools=%d prompt_start=%.200s prompt_end=%.200s",
+            self.rollout_cache.step, len(messages), len(prompt_ids), len(self.tools),
+            prompt_text[:200].replace("\n", "\\n"),
+            prompt_text[-200:].replace("\n", "\\n"),
+        )
         return lm_input
 
     def formulate_rollouts(self, rollout_cache: RolloutCache):
+        """Dispatch to step-level or trajectory-level sample formulation based on config."""
+        formulate_mode = self.cfg_template.get("formulate_mode", "step")
+        if formulate_mode == "traj":
+            return self._formulate_rollouts_traj(rollout_cache)
+        return self._formulate_rollouts_step(rollout_cache)
+
+    def _formulate_rollouts_step(self, rollout_cache: RolloutCache):
         """
         Construct step-wise training samples from the collected trajectory.
+        One sample per chunk (original behavior).
         TODO: 相同前序合并优化
               样本构造方法：
                 - 按messages构造response_id
@@ -422,6 +452,181 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         batch.non_tensor_batch["tools"][-1] = json.dumps(self.tools)
 
         # 避免 trajectory_data dict 过大，导致写入/读取odps失败
+        colummns_config = [
+            ["trajectory_data", "string"],
+            ["messages", "string"],
+            ["tools", "string"],
+            ["exp_name", "string"],
+        ]
+        batch.meta_info["COLUMMNS_CONFIG"] = colummns_config
+        return batch
+
+    def _formulate_rollouts_traj(self, rollout_cache: RolloutCache):
+        """
+        Construct a single trajectory-level training sample by delegating token assembly
+        to TrajEnvManager.formulate_rollouts(), then adding AgentNative-specific metadata.
+        One sample per trajectory (used with TrajEnvManager swap for IPA).
+        """
+        # --- 1. Pre-compute data before TrajEnvManager modifies history ---
+        # The last history entry may be an observation-only entry (no 'reward' key).
+        # TrajEnvManager.formulate_rollouts() will pop it, but we need rewards first.
+        step_rewards = [i['reward'] for i in self.rollout_cache.history if 'reward' in i]
+        episode_score = sum(step_rewards)
+
+        step_prompt_length_list = []
+        step_response_length_list = []
+        all_messages: List[List[Dict]] = []
+        messages = None
+        for history in rollout_cache.history:
+            if "response_ids" not in history:
+                break
+            step_prompt_length_list.append(len(history["prompt_ids"]))
+            step_response_length_list.append(len(history["response_ids"]))
+
+            # Populate log_stats (same as step mode)
+            gen_idx = len(self.log_stats["response_length"])
+            if gen_idx < len(self.log_stats["generate_time"]):
+                generate_time = self.log_stats["generate_time"][gen_idx]
+            else:
+                generate_time = 0.0
+            self.log_stats["response_length"].append(len(history["response_ids"]))
+            if generate_time > 0.01:
+                tokens_per_second = len(history["response_ids"]) / generate_time
+                self.log_stats["tokens_per_second"].append(tokens_per_second)
+            else:
+                self.log_stats["tokens_per_second"].append(0.0)
+
+            messages = history.get("messages", None)
+
+        if messages is not None:
+            all_messages.append(messages)
+
+        # --- 2. Call TrajEnvManager.formulate_rollouts for token assembly ---
+        # TrajEnvManager handles: observation pop, history slicing, token concatenation,
+        # padding, and sets env_ids/group_ids/tags/step_scores/episode_scores in non_tensor_batch
+        # and input_ids/attention_mask/position_ids/response_mask/prompt_mask/scores/infer_logprobs in batch.
+        batch: DataProto = TrajEnvManager.formulate_rollouts(self, rollout_cache)
+
+        # --- 3. Compute response_length from the assembled batch ---
+        response_length = batch.batch["response_mask"].float().sum(-1).mean().item()
+
+        # --- 4. Build env/timing/length metrics (same pattern as step mode) ---
+        metrics_agg_mode = self.rollout_cache.history[-1].get('metrics_agg_mode', {})
+        history_metrics = [item.get("metrics", {}) for item in self.rollout_cache.history]
+        env_metric = aggregate_metrics(history_metrics=history_metrics, metrics_agg_mode=metrics_agg_mode)
+        env_metric["num_actions"] = rollout_cache.step
+        env_metric["env_timeout"] = getattr(self.env, "env_timeout", False)
+
+        # Guard against empty stat lists (e.g. single-step trajectories with no env step)
+        step_times = self.log_stats["step_time"] if self.log_stats["step_time"] else [0.0]
+        generate_times = self.log_stats["generate_time"] if self.log_stats["generate_time"] else [0.0]
+        response_lengths = self.log_stats["response_length"] if self.log_stats["response_length"] else [0.0]
+        tokens_per_second_list = self.log_stats["tokens_per_second"] if self.log_stats["tokens_per_second"] else [0.0]
+
+        timing_metric = {
+            "traj_time_env_total": round(float(time.time() - self.traj_start_time), 4),
+            "traj_time_reset": round(float(self.log_stats["reset_time"]), 4),
+            "traj_time_step": round(float(np.mean(step_times)), 4),
+            "traj_time_step_min": round(float(np.min(step_times)), 4),
+            "traj_time_step_max": round(float(np.max(step_times)), 4),
+            "traj_time_generate": round(float(np.mean(generate_times)), 4),
+            "traj_time_generate_min": round(float(np.min(generate_times)), 4),
+            "traj_time_generate_max": round(float(np.max(generate_times)), 4),
+            "traj_time_generate_sum": round(float(np.sum(generate_times)), 4),
+            "traj_time_response_length": round(float(np.mean(response_lengths)), 4),
+            "traj_time_response_length_min": round(float(np.min(response_lengths)), 4),
+            "traj_time_response_length_max": round(float(np.max(response_lengths)), 4),
+            "traj_time_tokens_per_second": round(float(np.mean(tokens_per_second_list)), 4),
+            "traj_time_tokens_per_second_min": round(float(np.min(tokens_per_second_list)), 4),
+            "traj_time_tokens_per_second_max": round(float(np.max(tokens_per_second_list)), 4),
+        }
+
+        # Guard against empty step length lists
+        step_prompt_lengths = step_prompt_length_list if step_prompt_length_list else [0.0]
+        step_response_lengths = step_response_length_list if step_response_length_list else [0.0]
+
+        length_metric = {
+            "response_length": float(response_length),
+            "step_prompt_length": round(float(np.mean(step_prompt_lengths)), 2),
+            "step_prompt_length_min": round(float(np.min(step_prompt_lengths)), 2),
+            "step_prompt_length_max": round(float(np.max(step_prompt_lengths)), 2),
+            "step_response_length": round(float(np.mean(step_response_lengths)), 2),
+            "step_response_length_min": round(float(np.min(step_response_lengths)), 2),
+            "step_response_length_max": round(float(np.max(step_response_lengths)), 2),
+        }
+
+        env_metric.update(timing_metric)
+        env_metric.update(length_metric)
+        env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
+        env_metric["env/response_length"] = response_length
+        batch.meta_info = {"metrics": env_metric}
+
+        # --- 5. Build traj_id and trajectory_data ---
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        start_step = self.log_stats["current_step"][0] if self.log_stats["current_step"] else 0
+        end_step = self.log_stats["current_step"][-1] if self.log_stats["current_step"] else 0
+        last_step_info = rollout_cache.history[-1]
+        failure_mode = last_step_info.get("failure_mode", "")
+        traj_id = (
+            f"{rollout_cache.tag}_{start_step}_{end_step}_{rollout_cache.group_id}"
+            f"_{rollout_cache.env_id}_{self.episode_id}_{self.group_seed}_{timestamp}"
+        )
+
+        trajectory_data = {
+            "trajectory_id": traj_id,
+            "timestamp": timestamp,
+            "current_step": self.current_step,
+            "env_info": {
+                "env_id": rollout_cache.env_id,
+                "group_id": rollout_cache.group_id,
+                "tag": rollout_cache.tag,
+                "seed": self.group_seed,
+                "episode_id": self.episode_id,
+                "max_steps": self.env_config.max_steps,
+                "mode": self.mode,
+                "sequence_length": self.pipeline_config.sequence_length,
+                **self.env.env_info
+            },
+            "timing_info": {
+                "traj_save_time": datetime.now().isoformat(),
+                **timing_metric
+            },
+            "length_info": {
+                "trajectory_length": rollout_cache.step,
+                "num_actions": rollout_cache.step,
+                "terminated": rollout_cache.terminated,
+                "truncated": rollout_cache.truncated,
+                **length_metric
+            },
+            "reward_info": {
+                "episode_reward": episode_score,
+                "step_rewards": step_rewards,
+                "first_round_reward": step_rewards[0] if step_rewards else 0,
+                "final_reward": step_rewards[-1] if step_rewards else 0
+            },
+            "failure_info": {
+                "failure_mode": failure_mode,
+                "stop_reason": self.stop_reason.name,
+                "error_messages": last_step_info.get("error_messages", []),
+                "test_output": last_step_info.get("test_output", ""),
+                "has_failure": bool(failure_mode and failure_mode not in ['', 'none']),
+                "failure_step": rollout_cache.step,
+            },
+            "metrics": env_metric,
+            "last_observation": []  # last_observation already popped by TrajEnvManager
+        }
+
+        # --- 6. Add AgentNative-specific non_tensor_batch fields ---
+        # (env_ids, group_ids, tags, step_scores, episode_scores are already set by TrajEnvManager)
+        batch.non_tensor_batch["traj_id"] = np.array([traj_id], dtype=object)
+        batch.non_tensor_batch["step"] = np.array([0], dtype=object)
+        batch.non_tensor_batch["state_hash"] = np.array([""], dtype=object)
+        batch.non_tensor_batch["trajectory_data"] = np.array([json.dumps(trajectory_data)], dtype=object)
+        batch.non_tensor_batch["messages"] = np.array([json.dumps(all_messages)], dtype=object)
+        batch.non_tensor_batch["tools"] = np.array([json.dumps(self.tools)], dtype=object)
+        batch.non_tensor_batch["exp_name"] = np.array([self.pipeline_config.exp_name], dtype=object)
+
+        # --- 7. Set COLUMMNS_CONFIG ---
         colummns_config = [
             ["trajectory_data", "string"],
             ["messages", "string"],
