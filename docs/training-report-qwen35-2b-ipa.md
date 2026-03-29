@@ -4,15 +4,15 @@
 
 We trained **Qwen3.5-2B** (2B parameter causal LM) on **kanishk/EndlessTerminals** (2,490 terminal-based coding tasks) using **IPA chunk-level loss** with trajectory-level optimization. The model improved significantly from the untrained baseline:
 
-| Metric | Baseline (untrained) | After 700 steps | Improvement |
-|--------|---------------------|-----------------|-------------|
-| **Validation score** (32 tasks) | **21.9%** | **50-75%** | +128-243% relative |
-| Train success rate (50-step avg) | 28.0% | 42.3% | +51% relative |
-| Avg actions per task | 22.0 | 11.2 | -49% (more efficient) |
-| Failed tool calls | 27.2% | ~2% | -92% |
-| Peak single-step success | - | 81.2% (step 335) | - |
+| Metric | Baseline (untrained) | Step 200 | Step 400 | Step 700 |
+|--------|---------------------|----------|----------|----------|
+| **Validation score** (n=32, fixed seed) | **21.9%** (7/32) | **34.4%** (11/32) | **50.0%** (16/32) | **31.2%** (10/32) |
+| Train success rate (50-step avg) | 28.0% | 36.9% | 38.5% | 42.3% |
+| Avg actions per task (val) | 22.0 | 16.2 | 10.8 | 14.6 |
+| Avg actions per task (train) | 18.2 | 13.7 | 14.1 | 11.2 |
+| Failed tool calls | 27.2% | ~2% | ~5% | ~2% |
 
-The baseline was measured by running the untrained Qwen3.5-2B on 32 validation tasks with fixed seed (`val/score/mean = 0.21875`). The trained model was validated at steps 200, 300, 400, 500, 600 during training.
+All validation scores measured on the same 32 tasks with fixed seed for fair comparison. Baseline = untrained Qwen3.5-2B.
 
 **Wandb**: project `roll-agentic`, runs [`kkspbsu4`](https://wandb.ai/shamanework-pl/roll-agentic/runs/kkspbsu4) (steps 0-199) and [`scrrezmd`](https://wandb.ai/shamanework-pl/roll-agentic/runs/scrrezmd) (steps 200-699)
 
@@ -222,16 +222,26 @@ Steps 650-699:  42.3%  avg_actions=11.2  |============        | (new high)
 
 ### 5.2 Validation Results
 
-| Step | Val Score | Val Success | Val Avg Actions | Notes |
-|------|-----------|-------------|-----------------|-------|
-| Baseline | **21.9%** | 7/32 | 22.0 | Untrained Qwen3.5-2B, 32 tasks |
-| 200 | **50.0%** | 2/4 | 15.5 | After first 200 steps |
-| 300 | **50.0%** | 2/4 | 16.8 | |
-| 400 | **75.0%** | 3/4 | 8.2 | Peak validation |
-| 500 | **50.0%** | 2/4 | 13.2 | |
-| 600 | **50.0%** | 2/4 | 8.5 | Fewer actions needed |
+#### Proper evaluation (n=32, fixed seed, apples-to-apples)
 
-Note: `val_batch_size=4` during training (high variance). Baseline measured with `val_batch_size=32`.
+| Model | Val Score | Tasks Solved | Val Avg Actions |
+|-------|-----------|-------------|-----------------|
+| Baseline (untrained) | **21.9%** | 7/32 | 22.0 |
+| Step 200 (checkpoint-199) | **34.4%** | 11/32 | 16.2 |
+| Step 400 (checkpoint-400) | **50.0%** | 16/32 | 10.8 |
+| Step 700 (checkpoint-699) | **31.2%** | 10/32 | 14.6 |
+
+**Key insight**: Step 400 is the best checkpoint on validation (50%, +128% over baseline). Step 700 shows higher train success (42.3%) but lower val score (31.2%), suggesting overfitting to the training distribution after step 400. The optimal checkpoint for deployment is **step 400**.
+
+#### During-training validation (n=4, high variance)
+
+| Step | Val Score | Tasks Solved | Val Avg Actions |
+|------|-----------|-------------|-----------------|
+| 200 | 50.0% | 2/4 | 15.5 |
+| 300 | 50.0% | 2/4 | 16.8 |
+| 400 | 75.0% | 3/4 | 8.2 |
+| 500 | 50.0% | 2/4 | 13.2 |
+| 600 | 50.0% | 2/4 | 8.5 |
 
 ### 5.3 Training Health Metrics (Step 200)
 

@@ -1,26 +1,19 @@
-# OpenReward + EndlessTerminals + IPA chunk-level loss config (v2)
-# Based on openreward_endless_terminals_IPA_qwen35_2b.yaml with these fixes:
-#   - LR scheduler: constant_with_warmup (fixes LR=0 after step 123)
-#   - batch_adjust_mode: delete (no duplicate padding that distorts IS ratio)
-#   - Dedicated 4+4 GPU split: GPUs 0-3 train, GPUs 4-7 infer
-#   - async_generation_ratio: 2 (deeper buffer, less idle)
-#   - TrajEnvManager mode: formulate_mode=traj (1 sample per trajectory)
+# Validation-only config for OpenReward + EndlessTerminals + IPA (v2)
+# Evaluates a checkpoint on 32 validation tasks without meaningful training.
 #
-# Usage (fresh training):
-#   Set: max_steps=200, resume_from_checkpoint=false, async_generation_ratio=64
-#   python examples/start_agentic_pipeline.py \
-#     --config_path agentic_demo \
-#     --config_name openreward_endless_terminals_IPA_qwen35_2b_v2
+# Usage:
+#   1. Set resume_from_checkpoint to your checkpoint path
+#   2. Set max_steps to checkpoint_step + 2
+#   3. Run:
+#      python examples/start_agentic_pipeline.py \
+#        --config_path agentic_demo \
+#        --config_name openreward_endless_terminals_IPA_qwen35_2b_v2_val
 #
-# Usage (continue from checkpoint):
-#   Set: max_steps=<target>, resume_from_checkpoint="/data/<run>/checkpoint-<step>"
-#   Keep async_generation_ratio=64 for training throughput
-#
-# Usage (eval only — validate a checkpoint):
-#   Set: max_steps=<ckpt_step+2>, eval_steps=1, val_batch_size=32
-#   Set: resume_from_checkpoint="/data/<run>/checkpoint-<step>"
-#   Set: async_generation_ratio=1, rollout_batch_size=4  (avoid wasting GPU on unused train rollouts)
-#   The pipeline skips to ckpt_step, runs 1 step with validation, then exits
+# Examples:
+#   Evaluate baseline (untrained):  resume_from_checkpoint=false, max_steps=1
+#   Evaluate step 199 checkpoint:   resume_from_checkpoint="/data/.../checkpoint-199", max_steps=201
+#   Evaluate step 400 checkpoint:   resume_from_checkpoint="/data/.../checkpoint-400", max_steps=402
+#   Evaluate step 699 checkpoint:   resume_from_checkpoint="/data/.../checkpoint-699", max_steps=701
 
 defaults:
   - ../config/deepspeed_zero@_here_
@@ -50,13 +43,13 @@ checkpoint_config:
 num_gpus_per_node: 8
 rpc_timeout: 72000
 
-max_steps: 200
-save_steps: 50
+max_steps: 201                           # set to checkpoint_step + 2
+save_steps: 10000                        # don't save checkpoints during eval
 logging_steps: 1
-eval_steps: 0                            # disabled — val can hang on hard tasks and block training
-resume_from_checkpoint: false
+eval_steps: 1                            # validate every step (triggers immediately)
+resume_from_checkpoint: "/data/20260327-220517/checkpoint-199"  # <-- change this
 
-async_generation_ratio: 64               # deep buffer for continuous training
+async_generation_ratio: 1                # minimal train rollouts (avoid wasting GPU)
 parse_tool_call_parameter_to_dict: true
 skip_mock_system_prompt: true
 
@@ -66,8 +59,8 @@ tracker_kwargs:
   project: roll-agentic
   name: ${exp_name}
 
-rollout_batch_size: 16
-val_batch_size: 4
+rollout_batch_size: 4                    # minimal — only needed for pipeline to run 1 step
+val_batch_size: 32                       # 32 tasks for statistically meaningful eval
 sequence_length: 32768
 
 max_tokens_per_step: 4096
