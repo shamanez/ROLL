@@ -76,27 +76,102 @@ def compute_discounted_returns(batch: DataProto, adv_estimator, gamma=1.0, failu
     if adv_estimator in ["gigpo", "step_reinforce"]:
         batch.batch["sample_order_placeholder"] = torch.arange(batch.batch.batch_size[0], device=batch.batch.device)
         batch_group_by_traj: Dict[str, DataProto] = batch.group_by(keys="traj_id")
+        is_any_traj_mode = False
+
         for traj_id, traj_batch in batch_group_by_traj.items():
+            step_scores_raw = traj_batch.non_tensor_batch["step_scores"]
 
-            indices: Tensor = torch.argsort(torch.from_numpy(traj_batch.non_tensor_batch["step"].astype(np.int64)))
-            traj_batch.reorder(indices)
-            step_scores = traj_batch.non_tensor_batch["step_scores"].astype(np.float32)
-            rewards = torch.as_tensor(step_scores).float()
+            # Detect traj mode: step_scores[0] is a list (TrajEnvManager) vs scalar (StepEnvManager)
+            first_score = step_scores_raw[0]
+            is_traj_mode = isinstance(first_score, (list, np.ndarray))
 
-            # IPA reward mapping: map zero-reward trajectories to failure_reward
-            if failure_reward is not None and rewards.sum().item() == 0.0:
-                # Terminal reward is 0 (failure) — replace with failure_reward at last step
-                rewards[-1] = failure_reward
-            discounts = torch.empty_like(rewards)
-            running_return = 0.0
-            for t in reversed(range(len(rewards))):
-                running_return = rewards[t] + gamma * running_return
-                discounts[t] = running_return
-            traj_batch.batch["step_rewards"] = discounts
+            if is_traj_mode:
+                # Traj mode: single sample, step_scores[0] is a list of per-step rewards
+                rewards_list = list(first_score)
+                rewards = torch.tensor(rewards_list, dtype=torch.float32)
 
-        merged = DataProto.concat(list(batch_group_by_traj.values()))
+                # Guard: empty trajectory (no valid chunks)
+                if len(rewards) == 0:
+                    seq_len = traj_batch.batch["response_mask"][0].shape[0]
+                    num_samples = traj_batch.batch.batch_size[0]
+                    traj_batch.batch["step_rewards"] = torch.zeros(num_samples, seq_len, dtype=torch.float32)
+                    is_any_traj_mode = True
+                    continue
+
+                # IPA failure_reward mapping
+                if failure_reward is not None and rewards.sum().item() == 0.0:
+                    rewards[-1] = failure_reward
+
+                # Compute discounted returns G_k for each step k
+                num_steps = len(rewards)
+                discounts = torch.empty(num_steps, dtype=torch.float32)
+                running_return = 0.0
+                for t in reversed(range(num_steps)):
+                    running_return = rewards[t].item() + gamma * running_return
+                    discounts[t] = running_return
+
+                # Fill token-level tensor: each response segment k gets G_k at all positions
+                response_mask = traj_batch.batch["response_mask"][0]  # [seq_len]
+                seq_len = response_mask.shape[0]
+                step_rewards_tensor = torch.zeros(seq_len, dtype=torch.float32)
+
+                # Find segment boundaries using diff on response_mask
+                diff = torch.diff(response_mask.float(), prepend=torch.tensor([0.0]))
+                segment_starts = torch.where(diff == 1)[0]
+                segment_ends = torch.where(diff == -1)[0]
+                if len(response_mask) > 0 and response_mask[-1] == 1:
+                    segment_ends = torch.cat([segment_ends, torch.tensor([seq_len])])
+
+                # Assign G_k to all tokens in segment k
+                num_segments = min(len(segment_starts), len(segment_ends), len(discounts))
+                for k in range(num_segments):
+                    start_idx = segment_starts[k].item()
+                    end_idx = segment_ends[k].item()
+                    step_rewards_tensor[start_idx:end_idx] = discounts[k]
+
+                # Expand to match batch size (handles duplicated samples from adjust_batch)
+                num_samples = traj_batch.batch.batch_size[0]
+                traj_batch.batch["step_rewards"] = step_rewards_tensor.unsqueeze(0).expand(num_samples, -1).contiguous()
+                is_any_traj_mode = True
+            else:
+                # Step mode: existing logic unchanged
+                indices: Tensor = torch.argsort(
+                    torch.from_numpy(traj_batch.non_tensor_batch["step"].astype(np.int64))
+                )
+                traj_batch.reorder(indices)
+                step_scores = traj_batch.non_tensor_batch["step_scores"].astype(np.float32)
+                rewards = torch.as_tensor(step_scores).float()
+
+                # IPA reward mapping: map zero-reward trajectories to failure_reward
+                if failure_reward is not None and rewards.sum().item() == 0.0:
+                    # Terminal reward is 0 (failure) — replace with failure_reward at last step
+                    rewards[-1] = failure_reward
+                discounts = torch.empty_like(rewards)
+                running_return = 0.0
+                for t in reversed(range(len(rewards))):
+                    running_return = rewards[t] + gamma * running_return
+                    discounts[t] = running_return
+                traj_batch.batch["step_rewards"] = discounts
+
+        # Debug + fix: ensure all step_rewards have consistent dimensions before concat
+        traj_values = list(batch_group_by_traj.values())
+        for i, tv in enumerate(traj_values):
+            sr = tv.batch.get("step_rewards", None)
+            if sr is not None and sr.dim() == 1:
+                # Force 1D step_rewards to 2D to match traj mode
+                seq_len = tv.batch["response_mask"].shape[-1]
+                n = tv.batch.batch_size[0]
+                # 1D [N] from step mode — expand each scalar to full seq_len
+                tv.batch["step_rewards"] = sr.unsqueeze(-1).expand(n, seq_len).contiguous() * tv.batch["response_mask"].float()
+                logger.warning(
+                    f"[compute_discounted_returns] Forced step_rewards from 1D to 2D for traj {list(batch_group_by_traj.keys())[i]}, "
+                    f"batch_size={n}, is_traj_mode={isinstance(tv.non_tensor_batch.get('step_scores', [None])[0], (list, np.ndarray))}"
+                )
+        merged = DataProto.concat(traj_values)
         merged.reorder(indices=torch.argsort(merged.batch["sample_order_placeholder"]))
         merged.pop("sample_order_placeholder")
+        if is_any_traj_mode:
+            merged.meta_info["traj_reward_mode"] = True
         return merged
     else:
         return batch

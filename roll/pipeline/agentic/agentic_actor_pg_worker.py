@@ -700,7 +700,7 @@ class ActorWorker(BaseActorWorker):
                 "actor/ipa_scores_std": cached["ipa_scores_std"],
                 "actor/ipa_advantages_mean": cached["ipa_advantages_mean"],
                 "actor/ipa_advantages_max": cached["ipa_advantages_max"],
-                "actor/ipa_chunk_ratio_mean@sum": cached["ipa_chunk_ratio_mean"],
+                "actor/ipa_chunk_ratio_mean": cached["ipa_chunk_ratio_mean"],
                 "actor/ipa_chunk_ratio_max@max": cached["ipa_chunk_ratio_max"],
                 **ipa_loss_metrics,
             }
