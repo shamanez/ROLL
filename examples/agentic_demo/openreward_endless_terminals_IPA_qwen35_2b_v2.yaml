@@ -39,7 +39,7 @@ seed: 42
 logging_dir: ./output/logs
 output_dir: ./output
 model_name: ${exp_name}-${now:%Y%m%d_%H%M%S}
-rollout_dump_dir: /home/ubuntu/ALE-latest/ROLL-personal/output/rollout_dump
+rollout_dump_dir: /home/ubuntu/ALE-new/ROLL/output/rollout_dump
 system_envs:
   USE_MODELSCOPE: '1'
 
@@ -56,14 +56,14 @@ logging_steps: 1
 eval_steps: 0                            # disabled — val can hang on hard tasks and block training
 resume_from_checkpoint: false
 
-async_generation_ratio: 64               # deep buffer for continuous training
+async_generation_ratio: 16              # deep buffer for continuous training
 parse_tool_call_parameter_to_dict: true
 skip_mock_system_prompt: true
 
 track_with: wandb
 tracker_kwargs:
   api_key: ${oc.env:WANDB_API_KEY}
-  project: roll-agentic
+  project: roll-agentic-new
   name: ${exp_name}
 
 rollout_batch_size: 16
@@ -100,8 +100,8 @@ train_infer_correction:
       ratio_high: 5.0                    # threshold H; chunks above are masked out
 
 # --- Model configs ---
-pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3.5-2B
-reward_pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3.5-2B
+pretrain: /home/ubuntu/ALE-new/model-checkpoints/Qwen3.5-2B 
+reward_pretrain: /home/ubuntu/ALE-new/model-checkpoints/Qwen3.5-2B 
 actor_train:
   worker_cls: roll.pipeline.agentic.agentic_actor_pg_worker.ActorWorker
   pg_variant: "ipa_chunk"                # chunk-level IPA loss (paper Eq. 9)
@@ -185,7 +185,7 @@ reward_normalization:
   method: identity
 
 # --- Environment config (OpenReward) ---
-max_actions_per_traj: 25                 # 25 turns max
+max_actions_per_traj: 15                 # 25 turns max
 env_manager_cls: roll.pipeline.agentic.env_manager.agent_native_env_manager.AgentNativeStepEnvManager
 
 train_env_manager:
