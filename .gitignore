@@ -170,3 +170,6 @@ log
 
 output/
 .vscode/
+
+# Weights & Biases
+wandb/

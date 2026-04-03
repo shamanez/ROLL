@@ -26,9 +26,10 @@ seed: 42
 logging_dir: ./output/logs
 output_dir: ./output
 model_name: ${exp_name}-${now:%Y%m%d_%H%M%S}
-rollout_dump_dir: /home/ubuntu/ALE-latest/ROLL-personal/output/rollout_dump
+rollout_dump_dir: /home/ubuntu/ROLL-PR/ROLL/output/rollout_dump
 system_envs:
   USE_MODELSCOPE: '1'
+  OPENREWARD_API_KEY: ${oc.env:OPENREWARD_API_KEY}
 
 checkpoint_config:
   type: file_system
@@ -37,44 +38,66 @@ checkpoint_config:
 num_gpus_per_node: 8
 rpc_timeout: 72000
 
-max_steps: 10
+max_steps: 5000
 save_steps: 50
 logging_steps: 1
-eval_steps: 0
+eval_steps: 25                           # full validation every 25 steps
 resume_from_checkpoint: false
 
-async_generation_ratio: 1
+async_generation_ratio: 16              # deep buffer for continuous training
 parse_tool_call_parameter_to_dict: true
 skip_mock_system_prompt: true
 
 track_with: wandb
 tracker_kwargs:
   api_key: ${oc.env:WANDB_API_KEY}
-  project: roll-agentic
+  project: roll-agentic-topr
   name: ${exp_name}
 
-rollout_batch_size: 16
-val_batch_size: 1
+rollout_batch_size: 16                   # 32 trajectories per pipeline step for more diverse gradient signal
+val_batch_size: 4
 sequence_length: 32768
 
 max_tokens_per_step: 4096
 
-# --- Vanilla STEP_REINFORCE config ---
-advantage_clip: 0.2
+# --- TOPR + chunk-level config (IPA-equivalent via composable components) ---
+# Positive chunks: weighted SFT (no IS ratio). Negative chunks: TIS [0,1].
+# With binary 0/1 rewards, negative G_k=0, so positive-only training by default.
+# No advantage_clip — G_k values (1.0, 0.95, 0.90...) must pass through unclipped
+# to preserve chunk-level temporal credit from Eq. 7.
 ppo_epochs: 1
 adv_estimator: "step_reinforce"
-batch_adjust_mode: "random_sample"
-step_reward_gamma: 1.0
+batch_adjust_mode: "delete"              # trim excess — no duplicate padding
+step_reward_gamma: 0.95                  # chunk-level temporal credit: G_k = 0.95^{K-k} * R_final
+ratio_type: "segment"                    # chunk-level geometric mean IS ratio (paper Eq. 8)
+ratio_reference: "infer"                 # use vLLM infer_logprobs as behavior policy (true off-policy ratio)
 
 init_kl_coef: 0.0
-whiten_advantages: true
+whiten_advantages: false                 # use absolute returns, no relative ranking
 entropy_loss_coef: 0
 max_grad_norm: 1.0
+
+# Skip redundant Megatron old_log_probs recompute (ratio ≈ 1.0 with ppo_epochs=1).
+# train_infer_correction still runs inside the worker using fresh log_probs vs vLLM infer_logprobs.
+force_disable_old_logprobs_recompute: true
+
+# Train-infer mismatch mask: filter chunks where policy has drifted from vLLM rollout
+train_infer_correction:
+  is_weight:
+    enabled: false
+  filters:
+    - enabled: true
+      agg_type: segment                  # chunk-level geometric mean mismatch
+      ratio_enabled: true
+      ratio_low: 0.0
+      ratio_high: 5.0                    # threshold H; chunks above are masked out
 
 # --- Model configs ---
 pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3.5-2B
 reward_pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3.5-2B
 actor_train:
+  worker_cls: roll.pipeline.agentic.agentic_actor_pg_worker.ActorWorker
+  pg_variant: "topr"                       # positive=SFT, negative=TIS[0,1] (paper Eq. 5/9)
   model_args:
     flash_attn: sdpa
     attn_implementation: sdpa
@@ -84,10 +107,11 @@ actor_train:
     freeze_module_prefix: vision_model
   training_args:
     learning_rate: 1.0e-6
+    lr_scheduler_type: "constant_with_warmup"  # prevents LR decay to 0
     weight_decay: 0
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 4
-    warmup_steps: 0
+    gradient_accumulation_steps: 16       # larger effective batch: ~48 steps per optimizer step (~6 positive on avg)
+    warmup_steps: 10
   data_args:
     template: qwen3_coder
   strategy_args:
@@ -122,12 +146,12 @@ actor_infer:
   strategy_args:
     strategy_name: vllm
     strategy_config:
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.8
       block_size: 16
       load_format: auto
       tensor_parallel_size: 1
       max_model_len: 32768
-  device_mapping: list(range(0,8))
+  device_mapping: list(range(4,8))       # GPUs [4,5,6,7]
 
 reference:
   model_args:
@@ -153,22 +177,26 @@ reward_normalization:
   method: identity
 
 # --- Environment config (OpenReward) ---
-max_actions_per_traj: 16
+max_actions_per_traj: 20
 env_manager_cls: roll.pipeline.agentic.env_manager.agent_native_env_manager.AgentNativeStepEnvManager
 
 train_env_manager:
   max_env_num_per_worker: 1
-  num_env_groups: 1
+  num_env_groups: 8                     # 8 parallel env workers for faster rollout
   group_size: 1
   tags: [OpenRewardEndlessTerminalsTrain]
-  num_groups_partition: [1]
+  num_groups_partition: [8]
+  system_envs:
+    OPENREWARD_API_KEY: ${oc.env:OPENREWARD_API_KEY}
 
 val_env_manager:
   max_env_num_per_worker: 1
-  num_env_groups: 1
+  num_env_groups: 4
   group_size: 1
   tags: [OpenRewardEndlessTerminalsVal]
-  num_groups_partition: [1]
+  num_groups_partition: [4]
+  system_envs:
+    OPENREWARD_API_KEY: ${oc.env:OPENREWARD_API_KEY}
 
 custom_envs:
   OpenRewardEndlessTerminalsTrain:

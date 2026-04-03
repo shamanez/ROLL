@@ -207,6 +207,12 @@ class AgenticConfig(PPOConfig):
     step_reward_weight: float = field(default=1.0, metadata={"help": "Step reward weight, used in GiGPO."})
     step_reward_gamma: float = field(default=0.95, metadata={"help": "Gamma parameter for step reward calculation"})
     ratio_type: Literal["token", "segment"] = field(default="token", metadata={"help": "Ratio type: token or segment"})
+    ratio_reference: Literal["old", "infer"] = field(
+        default="old",
+        metadata={"help": "Log-prob reference for IS ratio: 'old' uses old_log_probs (train model), "
+                          "'infer' uses vLLM infer_logprobs (true behavior policy). "
+                          "Use 'infer' with high async_generation_ratio for meaningful off-policy ratios."},
+    )
     exp_mode: str = field(
         default="train",
         metadata={

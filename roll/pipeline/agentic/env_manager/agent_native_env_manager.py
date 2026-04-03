@@ -133,7 +133,8 @@ class AgentNativeStepEnvManager(TrajEnvManager):
 
     def step(self, llm_output: DataProto):
         if llm_output.batch is not None:
-            response = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)[0]
+            skip_special = self.cfg_template.get("decode_skip_special_tokens", True)
+            response = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=skip_special)[0]
         else:
             response = self.stop_reason
         observation, reward, terminated, truncated, info = self.env.step(action=response)
@@ -186,12 +187,18 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         response_ids = lm_output.batch['responses'][0]
         response_ids = response_ids.tolist()
 
+        # Strip trailing pad tokens — vLLM may pad response tensors to max batch length.
+        pad_id = self.tokenizer.pad_token_id
+        while response_ids and response_ids[-1] == pad_id:
+            response_ids.pop()
+
         if "infer_logprobs" in lm_output.batch.keys():
             infer_logprobs = lm_output.batch['infer_logprobs'][0][-len(response_ids):]
             content["infer_logprobs"] = infer_logprobs.tolist()
 
         content["response_ids"] = response_ids
-        content["messages"].append({"role": "assistant", "content": self.tokenizer.decode(response_ids, skip_special_tokens=True)})
+        skip_special = self.cfg_template.get("decode_skip_special_tokens", True)
+        content["messages"].append({"role": "assistant", "content": self.tokenizer.decode(response_ids, skip_special_tokens=skip_special)})
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
         return lm_output
 

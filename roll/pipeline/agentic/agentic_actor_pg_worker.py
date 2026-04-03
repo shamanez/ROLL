@@ -62,13 +62,18 @@ class ActorWorker(BaseActorWorker):
         else:
             train_infer_is_weight = data.batch['train_infer_is_weight']
 
+        # Select log-prob reference for IS ratio: old_log_probs (train model) or infer_logprobs (vLLM behavior policy).
+        # With high async_generation_ratio, old_log_probs ≈ log_probs (ratio=1.0, useless).
+        # Using infer_logprobs gives π_current / μ_vllm — the true off-policy IS ratio.
+        ratio_ref = getattr(self.pipeline_config, 'ratio_reference', 'old')
+        ratio_base = infer_log_probs if ratio_ref == "infer" else old_log_probs
+
         if self.pipeline_config.ratio_type == "segment":
-            # 计算序列级别的 ratio：对每段连续的1分别计算 masked_mean，不连续的段不相乘
-            log_ratio = log_probs - old_log_probs
+            log_ratio = log_probs - ratio_base
             masked_log_ratio = compute_segment_masked_mean(log_ratio, response_mask)
             ratio = masked_log_ratio.exp()
         else:
-            ratio = (log_probs - old_log_probs).exp()
+            ratio = (log_probs - ratio_base).exp()
 
         pg_variant = self._get_or_cache_config("pg_variant", "vanilla")
         self._cached_metrics = {
@@ -310,11 +315,22 @@ class ActorWorker(BaseActorWorker):
         positive_token_mask = positive_mask.unsqueeze(-1).expand_as(log_probs)
         negative_token_mask = negative_mask.unsqueeze(-1).expand_as(log_probs)
 
-        positive_loss = -advantages * log_probs * positive_token_mask
+        # Positive branch: weighted SFT by default (paper Eq. 5/9 — no IS ratio).
+        # Optional soft upper bound for high async_generation_ratio where even positive
+        # samples can be very off-policy. None = no clipping (paper default).
+        topr_positive_clip = self._get_or_cache_config("topr_positive_clip", None)
+        if topr_positive_clip is not None:
+            pos_clipped_ratio = torch.clamp(ratio, min=0.0, max=topr_positive_clip).detach()
+            positive_loss = -pos_clipped_ratio * advantages * log_probs * positive_token_mask
+        else:
+            positive_loss = -advantages * log_probs * positive_token_mask
 
-        # 负样本: TIS更新，使用clipped importance sampling ratio
-        # 梯度是: -[π(τ)/μ(τ)]_0^1 * R(τ) * ∇log π(τ)
-        clipped_ratio = torch.clamp(ratio, min=0.0, max=1.0).detach()
+        # Negative branch: TIS clipped [0, 1] (paper Eq. 5/9).
+        # Caps at 1 (never amplify push-down beyond on-policy), attenuates below 1
+        # (model already moved away). Configurable bounds for experimentation.
+        topr_negative_clip_low = self._get_or_cache_config("topr_negative_clip_low", 0.0)
+        topr_negative_clip_high = self._get_or_cache_config("topr_negative_clip_high", 1.0)
+        clipped_ratio = torch.clamp(ratio, min=topr_negative_clip_low, max=topr_negative_clip_high).detach()
         negative_loss = -clipped_ratio * advantages * log_probs * negative_token_mask
 
         weighted_positive_loss = positive_weight * positive_loss
@@ -322,10 +338,11 @@ class ActorWorker(BaseActorWorker):
 
         topr_loss = weighted_positive_loss + weighted_negative_loss
 
-        # 缓存TOPR相关指标
-        negative_lower_clipped = ((ratio < 0.0) & (negative_token_mask > 0)).float()
-        negative_upper_clipped = ((ratio > 1.0) & (negative_token_mask > 0)).float()
+        # Cache metrics
+        negative_lower_clipped = ((ratio < topr_negative_clip_low) & (negative_token_mask > 0)).float()
+        negative_upper_clipped = ((ratio > topr_negative_clip_high) & (negative_token_mask > 0)).float()
         negative_total_clipped = negative_lower_clipped + negative_upper_clipped
+        positive_clipped = ((ratio > (topr_positive_clip or float('inf'))) & (positive_token_mask > 0)).float()
         self._cached_metrics.update(
             {
                 "topr_positive_loss": positive_loss,
@@ -341,6 +358,10 @@ class ActorWorker(BaseActorWorker):
                 "topr_negative_lower_clipfrac": negative_lower_clipped.mean().detach().item(),
                 "topr_negative_upper_clipfrac": negative_upper_clipped.mean().detach().item(),
                 "topr_negative_total_clipfrac": negative_total_clipped.mean().detach().item(),
+                "topr_positive_clipfrac": positive_clipped.mean().detach().item(),
+                "topr_positive_clip": topr_positive_clip,
+                "topr_negative_clip_low": topr_negative_clip_low,
+                "topr_negative_clip_high": topr_negative_clip_high,
                 "topr_scores_mean": scores.mean().detach().item(),
                 "topr_scores_std": scores.std().detach().item(),
             }

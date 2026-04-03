@@ -9,6 +9,157 @@ from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
+# Hardcoded clean tool definitions for kanishk/EndlessTerminals.
+# The raw OpenReward schemas lack clear guidance for a 2B model — e.g. the
+# model omits "description", confuses create_file vs str_replace, or
+# hallucinates tools ("think", "tview"). These curated specs reduce format
+# errors and give the model more productive steps per trajectory.
+# ---------------------------------------------------------------------------
+
+QWEN_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a bash command in the container.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Bash command to run in container",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Why I'm running this command",
+                    },
+                },
+                "required": ["command", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": (
+                "Create a NEW file at path with the given file_text content. "
+                "Use this when the file does not exist yet. "
+                "Do NOT use str_replace to create files."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to create",
+                    },
+                    "file_text": {
+                        "type": "string",
+                        "description": "Content to write to the file",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Why I'm creating this file",
+                    },
+                },
+                "required": ["path", "file_text", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "str_replace",
+            "description": (
+                "Edit an EXISTING file by replacing an exact substring. "
+                "Requires old_str (the exact text to find) and new_str (the replacement). "
+                "The file must already exist. Do NOT use this to create new files — use create_file instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to edit",
+                    },
+                    "old_str": {
+                        "type": "string",
+                        "description": "String to replace (must be unique in file)",
+                    },
+                    "new_str": {
+                        "type": "string",
+                        "default": "",
+                        "description": "String to replace with (empty to delete)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Why I'm making this edit",
+                    },
+                },
+                "required": ["path", "old_str", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_answer",
+            "description": (
+                "Call this when you have fully completed the task and all requirements are met. "
+                "Do not call any other tools after this."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view",
+            "description": "View file contents or directory listings.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to file or directory",
+                    },
+                    "view_range": {
+                        "anyOf": [
+                            {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+                            },
+                            {"type": "null"},
+                        ],
+                        "default": None,
+                        "description": (
+                            "Optional line range for text files. "
+                            "Format: [start_line, end_line] where lines are indexed starting at 1. "
+                            "Use [start_line, -1] to view from start_line to end."
+                        ),
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Why I need to view this",
+                    },
+                },
+                "required": ["path", "description"],
+            },
+        },
+    },
+]
+
+_HARDCODED_TOOLS = {t["function"]["name"]: t for t in QWEN_TOOLS}
+
+
+# ---------------------------------------------------------------------------
 # Tool-spec conversion: OpenReward spec → Qwen chat-template dict
 # ---------------------------------------------------------------------------
 
@@ -16,9 +167,9 @@ def openreward_spec_to_qwen_tool(spec: Any) -> Dict[str, Any]:
     """Convert an OpenReward tool spec to the dict format expected by
     ``tokenizer.apply_chat_template(tools=[...])``.
 
-    The Qwen3.5 chat template expects each tool as::
-
-        {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
+    Uses hardcoded definitions for known EndlessTerminals tools (bash,
+    create_file, str_replace, submit_answer, view) to give the model
+    clearer parameter guidance. Falls back to raw spec for unknown tools.
 
     Args:
         spec: OpenReward tool spec with ``.name``, ``.input_schema``, ``.description``.
@@ -26,6 +177,8 @@ def openreward_spec_to_qwen_tool(spec: Any) -> Dict[str, Any]:
     Returns:
         A dict compatible with the Qwen tokenizer's ``tools`` parameter.
     """
+    if spec.name in _HARDCODED_TOOLS:
+        return _HARDCODED_TOOLS[spec.name]
     return {
         "type": "function",
         "function": {

@@ -166,7 +166,8 @@ class TrajEnvManager(BaseEnvManager):
         return self.rollout_cache
 
     def step(self, llm_output: DataProto):
-        responses = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)
+        skip_special = self.cfg_template.get("decode_skip_special_tokens", True)
+        responses = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=skip_special)
 
         with self.thread_lock, self.env_step_limiter:
             observation, reward, terminated, truncated, info = self.env.step(action=responses[0])
@@ -228,7 +229,8 @@ class TrajEnvManager(BaseEnvManager):
             content["infer_logprobs"] = infer_logprobs.tolist()
 
         content["response_ids"] = response_ids
-        content["messages"].append({"role": "assistant", "content": self.tokenizer.decode(response_ids, skip_special_tokens=True)})
+        skip_special = self.cfg_template.get("decode_skip_special_tokens", True)
+        content["messages"].append({"role": "assistant", "content": self.tokenizer.decode(response_ids, skip_special_tokens=skip_special)})
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
         return lm_output
 

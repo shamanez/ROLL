@@ -213,7 +213,8 @@ class VLTrajEnvManager(TrajEnvManager):
         # Similar to agent_native_env_manager.py:133-157
         # If stop_reason is MAX_LENGTH, pass it to env; otherwise decode response
         if llm_output.batch is not None:
-            response = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)[0]
+            skip_special = self.cfg_template.get("decode_skip_special_tokens", True)
+            response = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=skip_special)[0]
         else:
             # When MAX_LENGTH, batch may be None, pass stop_reason as action
             response = self.stop_reason if self.stop_reason else ""
