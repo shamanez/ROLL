@@ -66,6 +66,7 @@ class OpenRewardEnv(Env):
         nonterminal_reward: Optional[float] = None,
         retry_max_attempts: int = 3,
         retry_backoff_seconds: float = 5.0,
+        val_size: int = 200,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -78,6 +79,7 @@ class OpenRewardEnv(Env):
         self._nonterminal_reward = nonterminal_reward
         self._retry_max_attempts = retry_max_attempts
         self._retry_backoff_seconds = retry_backoff_seconds
+        self._val_size = val_size
 
         # --- SDK handles (lazy: created once in __init__) ---
         from openreward import OpenReward
@@ -86,9 +88,13 @@ class OpenRewardEnv(Env):
         self._client = OpenReward(api_key=api_key) if api_key else OpenReward()
         self._or_env = self._client.environments.get(name=environment_name)
         self._num_tasks: int = self._or_env.num_tasks(split)
+        effective_pool = (
+            min(val_size, self._num_tasks) if mode == "val"
+            else max(1, self._num_tasks - val_size)
+        )
         logger.info(
-            "[OpenRewardEnv] Connected to %s — %d %s tasks",
-            environment_name, self._num_tasks, split,
+            "[OpenRewardEnv] Connected to %s — %d %s tasks (mode=%s pool=%d val_size=%d)",
+            environment_name, self._num_tasks, split, mode, effective_pool, val_size,
         )
 
         # --- Episode state (reset each episode) ---
@@ -125,9 +131,16 @@ class OpenRewardEnv(Env):
         super().reset(seed=seed)
         self._clean_state()
 
-        # Derive a deterministic task index from the seed
+        # Derive a deterministic task index from the seed.
+        # The first val_size task indices (0..val_size-1) are held out for validation;
+        # training draws from the remaining pool (val_size..num_tasks-1).
         if seed is not None:
-            self._task_index = seed % self._num_tasks
+            if self._mode == "val":
+                effective_pool = min(self._val_size, self._num_tasks)
+                self._task_index = seed % effective_pool
+            else:
+                train_pool = max(1, self._num_tasks - self._val_size)
+                self._task_index = self._val_size + (seed % train_pool)
         else:
             self._task_index = 0
 

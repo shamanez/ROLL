@@ -44,7 +44,7 @@ logging_steps: 1
 eval_steps: 25                           # full validation every 25 steps
 resume_from_checkpoint: false
 
-async_generation_ratio: 16              # deep buffer for continuous training
+async_generation_ratio: 8               # async buffer depth (8 pipeline steps ahead)
 parse_tool_call_parameter_to_dict: true
 skip_mock_system_prompt: true
 
@@ -54,8 +54,8 @@ tracker_kwargs:
   project: roll-agentic-topr
   name: ${exp_name}
 
-rollout_batch_size: 16                   # 32 trajectories per pipeline step for more diverse gradient signal
-val_batch_size: 4
+rollout_batch_size: 16                   # trajectories collected per pipeline step
+val_batch_size: 200                      # run all 200 held-out validation tasks per eval
 sequence_length: 32768
 
 max_tokens_per_step: 4096
@@ -68,6 +68,7 @@ max_tokens_per_step: 4096
 ppo_epochs: 1
 adv_estimator: "step_reinforce"
 batch_adjust_mode: "delete"              # trim excess — no duplicate padding
+filter_positive_only: true               # drop zero-reward samples before training; TOPR loss is zero for failures
 step_reward_gamma: 0.95                  # chunk-level temporal credit: G_k = 0.95^{K-k} * R_final
 ratio_type: "segment"                    # chunk-level geometric mean IS ratio (paper Eq. 8)
 ratio_reference: "infer"                 # use vLLM infer_logprobs as behavior policy (true off-policy ratio)
@@ -110,7 +111,7 @@ actor_train:
     lr_scheduler_type: "constant_with_warmup"  # prevents LR decay to 0
     weight_decay: 0
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 16       # larger effective batch: ~48 steps per optimizer step (~6 positive on avg)
+    gradient_accumulation_steps: 64       # with filter_positive_only + ~12% success: positive samples fit in one accum window → 1 optimizer step/pipeline step
     warmup_steps: 10
   data_args:
     template: qwen3_coder
@@ -210,6 +211,7 @@ custom_envs:
       environment_name: "kanishk/EndlessTerminals"
       split: "train"
       mode: "train"
+      val_size: 200                      # first 200 tasks held out; training draws from index 200..num_tasks-1
       max_steps: ${max_actions_per_traj}
       reward_reduction: "sum"
       nonterminal_reward: 0.0
@@ -226,6 +228,7 @@ custom_envs:
       environment_name: "kanishk/EndlessTerminals"
       split: "train"
       mode: "val"
+      val_size: 200                      # validation draws from task indices 0..199 only
       max_steps: ${max_actions_per_traj}
       reward_reduction: "sum"
       nonterminal_reward: 0.0

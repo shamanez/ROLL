@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from multiprocessing import Pool
-from typing import List, Callable, Dict, Optional
+from typing import Dict, List, Callable, Optional, Tuple
 
 import imageio
 import numpy as np
@@ -260,6 +260,42 @@ def get_agentic_response_level_mask(data: "DataProto", pipeline_config: AgenticC
 
     data.batch["final_response_mask"] = final_response_mask
     return data, mask_metrics
+
+
+def filter_positive_only_samples(batch: DataProto) -> Tuple[DataProto, Dict]:
+    """Keep only samples from trajectories with positive episode reward (episode_score > 0).
+
+    With binary 0/1 rewards the TOPR loss for failed trajectories is exactly zero —
+    they produce no gradient but still consume forward/backward compute and, more
+    critically, inflate the number of optimizer micro-steps per pipeline step which
+    makes advantages stale.  Filtering to positives fixes both problems.
+
+    Args:
+        batch: Training batch containing ``non_tensor_batch["episode_scores"]``.
+
+    Returns:
+        ``(filtered_batch, metrics)`` where *filtered_batch* contains only positive
+        samples and *metrics* reports counts for logging.
+    """
+    episode_scores = batch.non_tensor_batch["episode_scores"].astype(np.float32)
+    keep_mask = episode_scores > 0
+    n_before = int(len(keep_mask))
+    n_kept = int(keep_mask.sum())
+
+    filter_metrics = {
+        "system/positive_sample_count": n_kept,
+        "system/total_sample_count": n_before,
+        "system/positive_sample_ratio": n_kept / max(n_before, 1),
+    }
+
+    if n_kept == 0 or n_kept == n_before:
+        return batch, filter_metrics
+
+    keep_mask_tensor = torch.tensor(keep_mask, dtype=torch.bool, device=batch.batch["input_ids"].device)
+    tensor_data = batch.batch[keep_mask_tensor]
+    non_tensor_data = {key: val[keep_mask] for key, val in batch.non_tensor_batch.items()}
+    filtered = DataProto(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=batch.meta_info)
+    return filtered, filter_metrics
 
 
 print_only_once = False

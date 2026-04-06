@@ -237,6 +237,16 @@ class AgenticConfig(PPOConfig):
         }
     )
 
+    filter_positive_only: bool = field(
+        default=False,
+        metadata={
+            "help": "Drop zero-reward trajectory samples before they enter the training loop. "
+                    "With binary 0/1 rewards the TOPR loss on failed trajectories is exactly zero, "
+                    "so filtering saves training compute and prevents stale-advantage collapse "
+                    "caused by too many optimizer micro-steps per pipeline step."
+        },
+    )
+
     def __post_init__(self):
         # Handle OPD mapping FIRST before any access to actor_train/actor_infer/reference
         # This ensures student_train/student_infer/teacher are mapped correctly

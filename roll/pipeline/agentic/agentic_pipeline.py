@@ -24,6 +24,7 @@ from roll.pipeline.agentic.utils import (
     compute_discounted_returns,
     compute_response_level_rewards,
     dump_rollout_trajectories,
+    filter_positive_only_samples,
     get_agentic_response_level_mask,
 )
 from roll.pipeline.base_pipeline import BasePipeline
@@ -469,13 +470,30 @@ class AgenticPipeline(BasePipeline):
                                                                                     update_mask_keys=batch.meta_info['loss_mask_keys'])
                         metrics.update(corr_metrics)
 
+                    # Filter to positive-only samples before training.
+                    # With binary 0/1 rewards, TOPR loss on failed trajectories is exactly zero
+                    # (no gradient contribution), but the forward/backward pass still runs and
+                    # — critically — each mini-batch triggers an optimizer step, making advantages
+                    # stale.  Dropping zero-reward samples keeps the batch small enough to fit in
+                    # one gradient accumulation window → one optimizer step per pipeline step.
+                    if self.pipeline_config.filter_positive_only:
+                        with Timer(name="filter_positive_only", logger=None) as filter_timer:
+                            batch, filter_metrics = filter_positive_only_samples(batch)
+                            metrics.update(filter_metrics)
+                        metrics["time/step_filter_positive"] = filter_timer.last
+                        logger.info(
+                            f"[step {global_step}] filter_positive_only: "
+                            f"kept {filter_metrics['system/positive_sample_count']}/"
+                            f"{filter_metrics['system/total_sample_count']} samples"
+                        )
+
                     # PHASE 14: Training (critic + actor)
                     with Timer(name="train_timer", logger=None) as train_timer:
                         if self.pipeline_config.adv_estimator == "gae":
                             critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
-                        # implement critic warmup
-                        if self.pipeline_config.critic_warmup <= global_step:
+                        # implement critic warmup; skip training if batch is empty after filtering
+                        if self.pipeline_config.critic_warmup <= global_step and len(batch) > 0:
                             batch_balance_metrics = batch_balance(batch, dp_size=self.actor_train.dp_size,
                                 minibatch_size=self.actor_train.dp_size * self.pipeline_config.actor_train.training_args.per_device_train_batch_size *
                                 self.pipeline_config.actor_train.training_args.gradient_accumulation_steps,
