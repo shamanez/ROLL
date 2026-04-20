@@ -58,7 +58,7 @@ def dump_rollout_render(save_dir, step, frames: List[List], env_ids: List, tags:
 
 
 @torch.no_grad()
-def compute_discounted_returns(batch: DataProto, adv_estimator, gamma=1.0) -> DataProto:
+def compute_discounted_returns(batch: DataProto, adv_estimator, gamma=1.0, failure_reward=None) -> DataProto:
     """
     Compute discounted returns for each trajectory in the batch.
 
@@ -66,6 +66,8 @@ def compute_discounted_returns(batch: DataProto, adv_estimator, gamma=1.0) -> Da
         batch (DataProto): A `DataProto` instance containing trajectories.
         adv_estimator (str): Advantage estimator type; only `"gigpo"` triggers computation here.
         gamma (float, optional): Discount factor applied to future rewards. Defaults to 1.0.
+        failure_reward (float, optional): If set, maps zero-reward trajectories to this value.
+            For IPA with +1/-1 rewards, set to -1.0 so failed trajectories contribute gradient.
 
     Returns:
         DataProto: Updated batch where each trajectory contains an extra tensor key
@@ -80,6 +82,11 @@ def compute_discounted_returns(batch: DataProto, adv_estimator, gamma=1.0) -> Da
             traj_batch.reorder(indices)
             step_scores = traj_batch.non_tensor_batch["step_scores"].astype(np.float32)
             rewards = torch.as_tensor(step_scores).float()
+
+            # IPA reward mapping: map zero-reward trajectories to failure_reward
+            if failure_reward is not None and rewards.sum().item() == 0.0:
+                # Terminal reward is 0 (failure) — replace with failure_reward at last step
+                rewards[-1] = failure_reward
             discounts = torch.empty_like(rewards)
             running_return = 0.0
             for t in reversed(range(len(rewards))):

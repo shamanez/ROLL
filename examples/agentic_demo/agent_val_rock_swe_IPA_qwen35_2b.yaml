@@ -10,13 +10,13 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "agentic_rollout_swe"
+exp_name: "agentic_rollout_swe_IPA_qwen35_2b"
 seed: 42
 
 logging_dir: ./output/logs
 output_dir: ./output
 model_name: ${exp_name}-${now:%Y%m%d_%H%M%S}
-rollout_dump_dir: ./output/rollout_dump
+rollout_dump_dir: /home/ubuntu/ALE-latest/ROLL-personal/output/rollout_dump
 system_envs:
   USE_MODELSCOPE: '1'
 
@@ -27,64 +27,93 @@ checkpoint_config:
 num_gpus_per_node: 8
 rpc_timeout: 72000
 
-max_steps: 20
-save_steps: 10
+# Smoke test: 5 steps to verify TIS ratio fix
+max_steps: 5
+save_steps: 50
 logging_steps: 1
-eval_steps: 5
+eval_steps: 0
 resume_from_checkpoint: false
 
-# async_generation_ratio: 1
+async_generation_ratio: 1
+parse_tool_call_parameter_to_dict: true
+skip_mock_system_prompt: true
 
-rollout_batch_size: 1
-val_batch_size: 1
+track_with: wandb
+tracker_kwargs:
+  api_key: "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"
+  project: roll-agentic
+  name: ${exp_name}
+
+rollout_batch_size: 8
+val_batch_size: 4
 sequence_length: 32768
 
-max_tokens_per_step: 2048
+max_tokens_per_step: 4096
 
-advantage_clip: 0.2
+# --- IPA chunk-level loss config ---
+# No advantage clipping — IPA uses raw G_k values
 ppo_epochs: 1
 adv_estimator: "step_reinforce"
 batch_adjust_mode: "random_sample"
-step_reward_gamma: 1.0
+step_reward_gamma: 0.95                  # chunk-level temporal credit: G_k = 0.95^{K-k} * R_final
+ipa_failure_reward: -1.0                 # Temporarily enabled to verify TIS ratio fix
+ratio_type: "segment"                    # chunk-level geometric mean IS ratio
 
-#pg_clip: 0.1
-#dual_clip_loss: True
 init_kl_coef: 0.0
-whiten_advantages: true
+whiten_advantages: false                 # IPA uses absolute returns, no relative ranking
 entropy_loss_coef: 0
 max_grad_norm: 1.0
 
+# Non-trivial IS ratio: use vLLM rollout logprobs as old_log_probs (not recomputed Megatron)
+force_disable_old_logprobs_recompute: true
 
-pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3-4B-Instruct-2507
-reward_pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3-4B-Instruct-2507
+# Train-infer mismatch mask (paper Section 8): chunk-level segment filter
+train_infer_correction:
+  is_weight:
+    enabled: false                       # IPA handles IS internally
+  filters:
+    - enabled: true
+      agg_type: segment                  # chunk-level geometric mean mismatch
+      ratio_enabled: true
+      ratio_low: 0.0
+      ratio_high: 5.0                    # threshold H; chunks above are masked out
+
+pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3.5-2B
+reward_pretrain: /home/ubuntu/ALE-latest/model-checkpoints/Qwen3.5-2B
 actor_train:
+  worker_cls: roll.pipeline.agentic.agentic_actor_pg_worker.ActorWorker
+  pg_variant: "ipa_chunk"                # chunk-level IPA loss (paper Eq. 9)
   model_args:
-    flash_attn: fa2
-    disable_gradient_checkpointing: false  # 保持启用梯度检查点
+    flash_attn: sdpa
+    attn_implementation: sdpa
+    disable_gradient_checkpointing: false
     dtype: bf16
     model_type: ~
+    freeze_module_prefix: vision_model
   training_args:
     learning_rate: 1.0e-6
     weight_decay: 0
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 1
+    gradient_accumulation_steps: 8
     warmup_steps: 0
   data_args:
     template: qwen3_coder
   strategy_args:
     strategy_name: megatron_train
     strategy_config:
-      tensor_model_parallel_size: 1
+      tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-      context_parallel_size: 1
-      use_distributed_optimizer: false
+      context_parallel_size: 2
+      sequence_parallel: true
+      use_distributed_optimizer: true
       recompute_granularity: full
-  device_mapping: list(range(2,3))
+  device_mapping: list(range(0,4))
   infer_batch_size: 1
 actor_infer:
   model_args:
-    flash_attn: fa2
+    flash_attn: sdpa
+    attn_implementation: sdpa
     disable_gradient_checkpointing: true
     dtype: bf16
   generating_args:
@@ -101,60 +130,57 @@ actor_infer:
   strategy_args:
     strategy_name: vllm
     strategy_config:
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.6
       block_size: 16
       load_format: auto
       tensor_parallel_size: 1
       max_model_len: 32768
-  device_mapping: list(range(1,2))
+  device_mapping: list(range(0,8))
 
 reference:
   model_args:
-    attn_implementation: fa2
+    attn_implementation: sdpa
     disable_gradient_checkpointing: true
     dtype: bf16
     model_type: ~
+    freeze_module_prefix: vision_model
   data_args:
     template: qwen3_coder
   strategy_args:
     strategy_name: megatron_infer
     strategy_config:
-      tensor_model_parallel_size: 1
+      tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-      context_parallel_size: 1
-  device_mapping: list(range(2,3))
+      context_parallel_size: 2
+  device_mapping: list(range(0,4))
   infer_batch_size: 1
 
+# IPA uses absolute returns — no reward normalization
 reward_normalization:
   grouping: traj_group_id
   method: identity
-  # norm_mean_type: batch
-  # norm_std_type: group
 
 train_env_manager:
   max_env_num_per_worker: 1
   num_env_groups: 1
-  # under the same group, the env config and env seed are ensured to be equal
-  group_size: 1
+  group_size: 8                          # 8 trajectories per SWE problem (up from 4)
   tags: [RockTBNativeEnvTrain]
-  num_groups_partition: [1] # If not set, all env names divide nums equally. Under the same group, the env config and env seed (prompt) are equal in each generation
+  num_groups_partition: [1]
   system_envs:
-    # if you cannot get python env in rock due to connetion error, try to use this, may expire in the future
     ROCK_RTENV_PYTHON_V31114_INSTALL_CMD: '[ -f cpython31115.tar.gz ] && rm cpython31115.tar.gz; [ -d python ] && rm -rf python; wget -q -O cpython31115.tar.gz https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/20260303/cpython-3.11.15+20260303-x86_64-unknown-linux-gnu-install_only.tar.gz && tar -xzf cpython31115.tar.gz && mv python runtime-env'
 
 val_env_manager:
   max_env_num_per_worker: 1
   num_env_groups: 1
-  group_size: 1 # should be set to 1 because val temperature is set to 0 and same prompt leads to same output
+  group_size: 4
   tags: [swebench_native_verified]
-  num_groups_partition: [1] # TODO: If not set, all env names divide nums equally. Under the same group, the env config and env seed (prompt) are equal in each generation
+  num_groups_partition: [1]
   system_envs:
-    # if you cannot get python env in rock due to connetion error, try to use this, may expire in the future
     ROCK_RTENV_PYTHON_V31114_INSTALL_CMD: '[ -f cpython31115.tar.gz ] && rm cpython31115.tar.gz; [ -d python ] && rm -rf python; wget -q -O cpython31115.tar.gz https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/20260303/cpython-3.11.15+20260303-x86_64-unknown-linux-gnu-install_only.tar.gz && tar -xzf cpython31115.tar.gz && mv python runtime-env'
 
 
-max_actions_per_traj: 60
+max_actions_per_traj: 25
 env_manager_cls: roll.pipeline.agentic.env_manager.agent_native_env_manager.AgentNativeStepEnvManager
 
 agent_config_common:
@@ -168,7 +194,7 @@ agent_config_common:
       timeout_seconds: 600
     - command: "apt-get install -y build-essential libc6-dev patch procps"
       timeout_seconds: 600
-    # Install helper tools like 'uv'    
+    # Install helper tools like 'uv'
     - command: "wget -q https://xrl-sandbox-bucket.oss-cn-hangzhou.aliyuncs.com/uv-files/uv-x86_64-unknown-linux-gnu.tar.gz && tar -xzf uv-x86_64-unknown-linux-gnu.tar.gz --strip-components=1 -C /usr/local/bin && uv --version"
       timeout_seconds: 600
   model_service_config:

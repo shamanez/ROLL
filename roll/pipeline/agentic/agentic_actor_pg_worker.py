@@ -19,6 +19,7 @@ class ActorWorker(BaseActorWorker):
         self._topr_sample_logged = False
         self._cispo_config_logged = False
         self._kimi15_config_logged = False
+        self._ipa_chunk_sample_logged = False
 
     def _get_or_cache_config(self, key, default_value):
         """获取或缓存配置值"""
@@ -63,12 +64,15 @@ class ActorWorker(BaseActorWorker):
             train_infer_is_weight = data.batch['train_infer_is_weight']
 
         if self.pipeline_config.ratio_type == "segment":
-            # 计算序列级别的 ratio：对每段连续的1分别计算 masked_mean，不连续的段不相乘
-            log_ratio = log_probs - old_log_probs
+            # Chunk-level geometric mean IS ratio (paper Eq. 8):
+            # ρ_k = exp(mean(log π_current - log π_behavior)) per chunk.
+            # Uses infer_logprobs (vLLM rollout) as behavior policy — the only surviving
+            # record of the behavior policy in async training where old weights are overwritten.
+            log_ratio = log_probs - infer_log_probs
             masked_log_ratio = compute_segment_masked_mean(log_ratio, response_mask)
             ratio = masked_log_ratio.exp()
         else:
-            ratio = (log_probs - old_log_probs).exp()
+            ratio = (log_probs - infer_log_probs).exp()
 
         pg_variant = self._get_or_cache_config("pg_variant", "vanilla")
         self._cached_metrics = {
@@ -91,6 +95,8 @@ class ActorWorker(BaseActorWorker):
             pg_loss = self._compute_cispo_loss(ratio, log_probs, advantages)
         elif pg_variant == "kimi15":  # Kimi15
             pg_loss = self._compute_kimi15_loss(ratio, log_probs, old_log_probs, advantages)
+        elif pg_variant == "ipa_chunk":  # Chunk-level IPA (paper Eq. 9)
+            pg_loss = self._compute_ipa_chunk_loss(ratio, log_probs, advantages, data)
         else:
             raise ValueError(f"Unsupported pg_variant: {pg_variant}")
 
@@ -464,6 +470,92 @@ class ActorWorker(BaseActorWorker):
 
         return kimi15_loss
 
+    def _compute_ipa_chunk_loss(
+        self,
+        ratio: torch.Tensor,
+        log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        data: DataProto,
+    ):
+        """
+        Chunk-level IPA loss (paper Eq. 9).
+
+        Positive chunks (R_final > 0): -G_k * log pi  (weighted SFT, no IS)
+        Non-positive chunks (R_final <= 0): -clip(rho_k, 0, 1) * G_k * log pi  (TIS)
+
+        With binary 0/1 rewards, non-positive branch contributes zero loss
+        since G_k = gamma^{K-k} * 0 = 0. The model learns by reinforcing
+        its own successful trajectories with temporal credit assignment.
+
+        Args:
+            ratio: chunk-level IS ratio (geometric mean via ratio_type=segment) [batch_size, seq_len]
+            log_probs: current policy log probs [batch_size, seq_len]
+            advantages: G_k values (chunk-level discounted returns) [batch_size, seq_len]
+            data: DataProto with episode scores
+
+        Returns:
+            ipa_loss: [batch_size, seq_len]
+        """
+        scores = get_episode_scores(data).to(current_platform.device_type)
+        positive_mask = (scores > 0).float()
+        negative_mask = (scores <= 0).float()
+
+        if not self._ipa_chunk_sample_logged:
+            total_samples = len(scores)
+            positive_count = positive_mask.sum().item()
+            negative_count = negative_mask.sum().item()
+            self.logger.info(
+                f"IPA sample distribution - total: {total_samples}, "
+                f"positive: {positive_count} ({positive_count/max(total_samples, 1)*100:.1f}%), "
+                f"non-positive: {negative_count} ({negative_count/max(total_samples, 1)*100:.1f}%)"
+            )
+            self.logger.info(
+                f"IPA scores - mean: {scores.mean().item():.4f}, std: {scores.std().item():.4f}, "
+                f"max: {scores.max().item():.4f}, min: {scores.min().item():.4f}"
+            )
+            self._ipa_chunk_sample_logged = True
+
+        positive_token_mask = positive_mask.unsqueeze(-1).expand_as(log_probs)
+        negative_token_mask = negative_mask.unsqueeze(-1).expand_as(log_probs)
+
+        # Positive branch (paper Eq. 9, left term): weighted SFT, no IS ratio.
+        # Directly reinforce successful chunks with weight G_k.
+        positive_loss = -advantages * log_probs * positive_token_mask
+
+        # Non-positive branch (paper Eq. 9, right term): chunk-level TIS clipped to [0, 1].
+        # The ratio here is already the chunk-level geometric mean (one scalar per chunk,
+        # broadcast to all tokens in the chunk via compute_segment_masked_mean).
+        # Truncation to [0, 1]: cap at 1 (never amplify push-down gradient beyond on-policy),
+        # natural attenuation below 1 (model already moved away from this action).
+        # Only has effect when ipa_failure_reward is set — with 0/1 rewards, G_k=0 for
+        # failures so TIS multiplies zero regardless.
+        clipped_ratio = torch.clamp(ratio, min=0.0, max=1.0).detach()
+        negative_loss = -clipped_ratio * advantages * log_probs * negative_token_mask
+
+        ipa_loss = positive_loss + negative_loss
+
+        # Cache IPA metrics
+        negative_upper_clipped = ((ratio > 1.0) & (negative_token_mask > 0)).float()
+        self._cached_metrics.update(
+            {
+                "ipa_positive_loss": positive_loss,
+                "ipa_negative_loss": negative_loss,
+                "ipa_positive_samples": positive_mask.sum().detach().item(),
+                "ipa_negative_samples": negative_mask.sum().detach().item(),
+                "ipa_positive_ratio": (positive_mask.sum() / max(positive_mask.size(0), 1)).detach().item(),
+                "ipa_negative_ratio": (negative_mask.sum() / max(negative_mask.size(0), 1)).detach().item(),
+                "ipa_tis_upper_clipfrac": negative_upper_clipped.mean().detach().item(),
+                "ipa_scores_mean": scores.mean().detach().item(),
+                "ipa_scores_std": scores.std().detach().item(),
+                "ipa_advantages_mean": advantages.mean().detach().item(),
+                "ipa_advantages_max": advantages.max().detach().item(),
+                "ipa_chunk_ratio_mean": ratio.mean().detach().item(),
+                "ipa_chunk_ratio_max": ratio.max().detach().item(),
+            }
+        )
+
+        return ipa_loss
+
     def _get_pg_metrics(self, data: DataProto, batch_num_tokens: dict, global_valid_samples: dict,):
         """
         获取Policy Gradient相关的指标，使用缓存的值避免重复计算
@@ -584,5 +676,34 @@ class ActorWorker(BaseActorWorker):
                 f"actor/kimi15_{key}": value for key, value in cached.items() if key.startswith("kimi15_")
             }
             base_metrics.update(kimi15_metrics)
+
+        elif pg_variant == "ipa_chunk":
+            ipa_loss_metrics = {
+                "actor/ipa_positive_loss": agg_loss(
+                    loss_mat=cached["ipa_positive_loss"],
+                    loss_mask=positive_token_mask,
+                    loss_agg_mode=self.pipeline_config.loss_agg_mode,
+                ).detach().item(),
+                "actor/ipa_negative_loss": agg_loss(
+                    loss_mat=cached["ipa_negative_loss"],
+                    loss_mask=negative_token_mask,
+                    loss_agg_mode=self.pipeline_config.loss_agg_mode,
+                ).detach().item(),
+            }
+            ipa_metrics = {
+                "actor/ipa_positive_samples@sum": cached["ipa_positive_samples"],
+                "actor/ipa_negative_samples@sum": cached["ipa_negative_samples"],
+                "actor/ipa_positive_ratio": cached["ipa_positive_ratio"],
+                "actor/ipa_negative_ratio": cached["ipa_negative_ratio"],
+                "actor/ipa_tis_upper_clipfrac": cached["ipa_tis_upper_clipfrac"],
+                "actor/ipa_scores_mean": cached["ipa_scores_mean"],
+                "actor/ipa_scores_std": cached["ipa_scores_std"],
+                "actor/ipa_advantages_mean": cached["ipa_advantages_mean"],
+                "actor/ipa_advantages_max": cached["ipa_advantages_max"],
+                "actor/ipa_chunk_ratio_mean@sum": cached["ipa_chunk_ratio_mean"],
+                "actor/ipa_chunk_ratio_max@max": cached["ipa_chunk_ratio_max"],
+                **ipa_loss_metrics,
+            }
+            base_metrics.update(ipa_metrics)
 
         return base_metrics
